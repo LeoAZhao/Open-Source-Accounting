@@ -1,0 +1,2 @@
+# Python deps for Scanner.py (PDF statement scanning)
+pdfplumber>=0.10.0
