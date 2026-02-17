@@ -1,45 +1,75 @@
+"""
+Crania Accounting System - Flask app with SQLite persistence.
+Run from source or as a PyInstaller-built Windows .exe.
+"""
 import os
 import sys
 import webbrowser
-import sqlite3
 from threading import Timer
-from flask import Flask, render_template_string, request, jsonify
 
-app = Flask(__name__)
+from flask import Flask, render_template_string, request, jsonify, redirect
 
-# Bundle-aware path
-def resource_path(relative_path):
-    try:
-        base_path = sys._MEIPASS
-    except:
-        base_path = os.path.abspath(".")
-    return os.path.join(base_path, relative_path)
+from database import db
 
-# SQLite DB path (bundled)
-DB_PATH = resource_path('accounting.db')
+# -----------------------------------------------------------------------------
+# Paths: development (source) vs frozen (PyInstaller bundle)
+# -----------------------------------------------------------------------------
+if getattr(sys, "frozen", False):
+    # Running as compiled .exe: resources are in _MEIPASS, DB next to exe
+    _MEIPASS = sys._MEIPASS
+    basedir = os.path.dirname(sys.executable)  # folder containing the .exe
+    template_folder = os.path.join(_MEIPASS, "templates")
+    static_folder = os.path.join(_MEIPASS, "static")
+    if not os.path.isdir(template_folder):
+        template_folder = None  # use default (no templates dir in bundle)
+    if not os.path.isdir(static_folder):
+        static_folder = None
+    app = Flask(
+        __name__,
+        template_folder=template_folder,
+        static_folder=static_folder,
+    )
+else:
+    # Running from source
+    basedir = os.path.abspath(os.path.dirname(__file__))
+    app = Flask(__name__)
 
-# Init DB
+# -----------------------------------------------------------------------------
+# Database: SQLite file in basedir (project root in dev, exe folder when frozen)
+# -----------------------------------------------------------------------------
+app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///" + os.path.join(basedir, "accounting.db")
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+
+db.init_app(app)
+
+# Import models after db is bound to app
+from models import Account, Transaction  # noqa: E402
+
+
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS transactions 
-                 (id INTEGER PRIMARY KEY, description TEXT, amount REAL, type TEXT)''')
-    conn.commit()
-    conn.close()
+    """Create tables and seed default accounts if missing."""
+    db.create_all()
+    if Account.query.count() == 0:
+        defaults = [
+            Account(name="Cash", type="asset", description="Cash on hand and bank"),
+            Account(name="Income", type="income", description="Revenue and income"),
+            Account(name="Expenses", type="expense", description="Operating expenses"),
+        ]
+        for acc in defaults:
+            db.session.add(acc)
+        db.session.commit()
 
-init_db()
 
-@app.route('/')
-def dashboard():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('SELECT description, amount, type FROM transactions ORDER BY id DESC LIMIT 20')
-    transactions = [{'description': row[0], 'amount': row[1], 'type': row[2]} for row in c.fetchall()]
-    c.execute('SELECT SUM(CASE WHEN type="income" THEN amount ELSE 0 END) - SUM(CASE WHEN type="expense" THEN amount ELSE 0 END) FROM transactions')
-    total = c.fetchone()[0] or 0
-    conn.close()
-    
-    html = """
+# Run at startup (first request or on import if we call it from main)
+with app.app_context():
+    init_db()
+
+
+# -----------------------------------------------------------------------------
+# Routes (preserve existing URLs and behavior)
+# -----------------------------------------------------------------------------
+
+DASHBOARD_HTML = """
 <!DOCTYPE html><html><head><title>Local Accounting</title>
 <style>body{font-family:Arial;margin:40px;background:#f5f5f5;}h1{color:#333;}.stats{display:flex;gap:20px;margin:20px 0;}
 .stat{background:#fff;padding:20px;border-radius:8px;box-shadow:0 2px 4px rgba(0,0,0,0.1);}.form-group{margin:20px 0;}
@@ -68,30 +98,87 @@ document.getElementById('transForm').onsubmit = async e => {
   else alert('Error adding transaction');
 };
 </script></body></html>"""
-    return render_template_string(html, transactions=transactions, total=total)
 
-@app.route('/add', methods=['POST'])
+
+@app.route("/")
+def dashboard():
+    """List recent transactions and show balance (from DB)."""
+    transactions = (
+        Transaction.query
+        .order_by(Transaction.id.desc())
+        .limit(20)
+        .all()
+    )
+    # Balance = sum(income) - sum(expense)
+    from sqlalchemy import func
+    income_total = db.session.query(func.coalesce(func.sum(Transaction.amount), 0)).filter(
+        Transaction.type == "income"
+    ).scalar() or 0
+    expense_total = db.session.query(func.coalesce(func.sum(Transaction.amount), 0)).filter(
+        Transaction.type == "expense"
+    ).scalar() or 0
+    total = float(income_total) - float(expense_total)
+    # Pass model objects; template uses t.description, t.amount, t.type
+    return render_template_string(DASHBOARD_HTML, transactions=transactions, total=total)
+
+
+@app.route("/add", methods=["POST"])
 def add_transaction():
-    data = request.json
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('INSERT INTO transactions (description, amount, type) VALUES (?, ?, ?)',
-              (data['description'], data['amount'], data['type']))
-    conn.commit()
-    conn.close()
-    return jsonify({'success': True})
+    """Create a new transaction and link to default accounts (CRUD create)."""
+    data = request.get_json()
+    if not data:
+        return jsonify({"success": False, "error": "JSON required"}), 400
+    description = data.get("description", "").strip()
+    try:
+        amount = float(data.get("amount", 0))
+    except (TypeError, ValueError):
+        return jsonify({"success": False, "error": "Invalid amount"}), 400
+    txn_type = (data.get("type") or "expense").lower()
+    if txn_type not in ("income", "expense"):
+        txn_type = "expense"
 
-@app.route('/clear')
+    cash = Account.query.filter_by(name="Cash", type="asset").first()
+    income = Account.query.filter_by(name="Income", type="income").first()
+    expenses = Account.query.filter_by(name="Expenses", type="expense").first()
+    if not all([cash, income, expenses]):
+        return jsonify({"success": False, "error": "Default accounts missing"}), 500
+
+    if txn_type == "income":
+        debit_account_id = cash.id
+        credit_account_id = income.id
+    else:
+        debit_account_id = expenses.id
+        credit_account_id = cash.id
+
+    txn = Transaction(
+        description=description,
+        amount=amount,
+        type=txn_type,
+        debit_account_id=debit_account_id,
+        credit_account_id=credit_account_id,
+    )
+    db.session.add(txn)
+    db.session.commit()
+    return jsonify({"success": True})
+
+
+@app.route("/clear")
 def clear_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('DELETE FROM transactions')
-    conn.commit()
-    conn.close()
-    return redirect('/')
+    """Delete all transactions (keeps accounts)."""
+    try:
+        Transaction.query.delete()
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+    return redirect("/")
 
-if __name__ == '__main__':
-    Timer(1, lambda: webbrowser.open('http://127.0.0.1:5000/?welcome')).start()
-    print("💰 Local Accounting Exe: http://127.0.0.1:5000")
-    print("Press Ctrl+C to quit")
-    app.run(debug=False, host='127.0.0.1', port=5000, threaded=True)
+
+# -----------------------------------------------------------------------------
+# Entry point (dev and PyInstaller)
+# -----------------------------------------------------------------------------
+if __name__ == "__main__":
+    Timer(1, lambda: webbrowser.open("http://127.0.0.1:5000/?welcome")).start()
+    print("💰 Local Accounting: http://127.0.0.1:5000")
+    print("   Data stored in:", os.path.join(basedir, "accounting.db"))
+    print("   Press Ctrl+C to quit")
+    app.run(debug=False, host="127.0.0.1", port=5000, threaded=True)
