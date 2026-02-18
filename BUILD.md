@@ -23,6 +23,11 @@ PyInstaller will automatically include `database.py` and `models.py` because the
 pyinstaller --onefile --windowed --name "CraniaAccounting" --add-data "accounting.db;." app.py
 ```
 
+For a fully self-contained exe (include DB + Scanner):
+```cmd
+pyinstaller --onefile --windowed --name "CraniaAccounting" --add-data "accounting.db;." --add-data "Scanner.py;." --hidden-import flask_sqlalchemy --hidden-import sqlalchemy.sql.default_comparator app.py
+```
+
 (If `accounting.db` does not exist yet, create an empty file or run the app once to create it, then re-run the build to include it.)
 
 - `--onefile`: Single .exe (no folder of dependencies).
