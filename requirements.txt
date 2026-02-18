@@ -1,6 +1,4 @@
 # Crania Accounting - Flask app (run from source)
 Flask>=3.0.0
 Flask-SQLAlchemy>=3.1.0
-
-# Optional: for PDF scanning (Scanner.py)
-# pdfplumber>=0.10.0
+pdfplumber>=0.10.0  # PDF scanning (embedded in app.py)

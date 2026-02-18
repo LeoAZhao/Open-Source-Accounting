@@ -701,77 +701,94 @@ def api_journal_post():
     return jsonify({"success": True, "id": je.id})
 
 
-@app.route("/api/scan-pdf", methods=["POST"])
-def api_scan_pdf():
-    """Upload PDF, run Scanner.py, return parsed CSV rows."""
-    import tempfile
-    import subprocess
-    import csv
-    import io
-    f = request.files.get("file")
-    if not f or not f.filename.lower().endswith(".pdf"):
-        return jsonify({"success": False, "error": "PDF file required"}), 400
-    scanner_path = os.path.join(getattr(sys, "_MEIPASS", basedir), "Scanner.py")
-    if not os.path.isfile(scanner_path):
-        scanner_path = os.path.join(basedir, "Scanner.py")
-    if not os.path.isfile(scanner_path):
-        return jsonify({"success": False, "error": "Scanner.py not found"}), 500
-    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-        f.save(tmp.name)
-        tmp_path = tmp.name
-    try:
-        out = subprocess.run(
-            [sys.executable, scanner_path, tmp_path],
-            capture_output=True,
-            text=True,
-            timeout=60,
-            cwd=basedir,
-        )
-        if out.returncode != 0:
-            return jsonify({"success": False, "error": out.stderr or "Scanner failed"}), 500
-        reader = csv.reader(io.StringIO(out.stdout))
-        rows = list(reader)
-    finally:
+def _scan_pdf_file(pdf_path):
+    """Embedded PDF scanner logic (from Scanner.py). Returns list of {account, debit, credit}.
+    Works in both dev and PyInstaller exe - no subprocess."""
+    def parse_num(s):
+        if not s:
+            return 0.0
+        s = str(s).replace(",", "").replace("$", "").strip()
         try:
-            os.unlink(tmp_path)
-        except Exception:
-            pass
-    if not rows or len(rows) < 2:
-        return jsonify({"success": False, "error": "No data extracted"}), 400
-    header = rows[0]
-    # Map: Account Name/ID, Total Debit, Total Credit, Net Change -> account, debit, credit
+            return float(s)
+        except ValueError:
+            return 0.0
+
+    rows = []
+    try:
+        import pdfplumber
+        with pdfplumber.open(pdf_path) as pdf:
+            for page in pdf.pages:
+                tables = page.extract_tables()
+                for table in (tables or []):
+                    for raw_row in table:
+                        if raw_row and any(cell and str(cell).strip() for cell in raw_row):
+                            rows.append([(c or "").strip() for c in raw_row])
+    except ImportError:
+        return None, "pdfplumber not installed. Run: pip install pdfplumber"
+    except Exception as e:
+        return None, str(e)
+
     result = []
-    from datetime import datetime
-    today = datetime.utcnow().strftime("%Y-%m-%d")
-    for row in rows[1:]:
+    for row in rows:
         if len(row) < 2:
             continue
         account = row[0] if row else ""
         debit = 0.0
         credit = 0.0
         if len(row) >= 4:
-            try:
-                debit = float(str(row[1]).replace(",", "").replace("$", ""))
-                credit = float(str(row[2]).replace(",", "").replace("$", ""))
-            except ValueError:
-                pass
+            debit = parse_num(row[1])
+            credit = parse_num(row[2])
         elif len(row) >= 2:
+            net = parse_num(row[1])
+            if net >= 0:
+                debit = net
+            else:
+                credit = abs(net)
+        result.append({"account": account, "debit": debit, "credit": credit})
+    if not result:
+        result.append({"account": "Uncategorized", "debit": 0.0, "credit": 0.0})
+    return result, None
+
+
+@app.route("/api/scan-pdf", methods=["POST"])
+def api_scan_pdf():
+    """Upload PDF, scan via embedded logic (no subprocess). Returns parsed rows."""
+    import tempfile
+    from datetime import datetime
+    f = request.files.get("file")
+    if not f or not f.filename.lower().endswith(".pdf"):
+        return jsonify({"success": False, "error": "PDF file required"}), 400
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+            f.save(tmp.name)
+            tmp_path = tmp.name
+        rows, err = _scan_pdf_file(tmp_path)
+        if err:
+            return jsonify({"success": False, "error": err}), 500
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        result = []
+        for r in rows:
+            if (r.get("debit") or 0) == 0 and (r.get("credit") or 0) == 0 and r.get("account") == "Uncategorized":
+                continue
+            result.append({
+                "account": r.get("account", ""),
+                "debit": float(r.get("debit", 0) or 0),
+                "credit": float(r.get("credit", 0) or 0),
+                "description": f"PDF Import: {r.get('account', '')}",
+                "date": today,
+            })
+        if not result:
+            return jsonify({"success": False, "error": "No transactions found in PDF"}), 400
+        return jsonify({"success": True, "rows": result})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+    finally:
+        if tmp_path:
             try:
-                net = float(str(row[1]).replace(",", "").replace("$", ""))
-                if net >= 0:
-                    debit = net
-                else:
-                    credit = abs(net)
-            except ValueError:
+                os.unlink(tmp_path)
+            except Exception:
                 pass
-        result.append({
-            "account": account,
-            "debit": debit,
-            "credit": credit,
-            "description": f"PDF Import: {account}",
-            "date": today,
-        })
-    return jsonify({"success": True, "rows": result})
 
 
 @app.route("/api/transactions/import", methods=["POST"])
@@ -1090,6 +1107,7 @@ SPA_HTML = r'''<!DOCTYPE html>
     .badge-posted{background:rgba(34,197,94,0.2);color:#22c55e;}
     .badge-void{background:rgba(239,68,68,0.2);color:#ef4444;}
     .badge-draft{background:rgba(148,163,184,0.2);color:#94a3b8;}
+    .scan-unmatched{background:rgba(239,68,68,0.08);} .border-expense{border-color:#ef4444;}
     .space-y-2>*+*{margin-top:0.5rem;}
     .hidden{display:none !important;}
     .line-through{text-decoration:line-through;}
@@ -1492,29 +1510,45 @@ SPA_HTML = r'''<!DOCTYPE html>
       else alert(j.error || 'Failed');
     }
     let scanRows = [];
+    function fuzzyMatchAccount(hint) {
+      if (!hint || !accounts.length) return accounts[0];
+      const h = (hint||'').toLowerCase().trim();
+      const match = accounts.find(a => (a.name||'').toLowerCase().includes(h) || (a.code||'').toString().includes(h) || h.includes((a.name||'').toLowerCase()) || h.includes((a.code||'').toString()));
+      if (match) return match;
+      const w = h.split(/\\s+/).filter(Boolean);
+      for (const a of accounts) {
+        const an = (a.name||'').toLowerCase(); const ac = (a.code||'').toString();
+        if (w.some(word => an.includes(word) || ac.includes(word))) return a;
+      }
+      return null;
+    }
     async function handleScanPdf(ev) {
       const f = ev.target.files[0]; if(!f) return;
-      const fd = new FormData(); fd.append('file', f);
-      const r = await fetch('/api/scan-pdf', { method: 'POST', body: fd });
-      const j = await r.json();
-      ev.target.value = '';
-      if (!j.success) { alert(j.error); return; }
-      scanRows = (j.rows || []).map(row => {
-        const match = accounts.find(a => (a.name||'').toLowerCase().includes((row.account||'').toLowerCase()) || (a.code||'').includes((row.account||'').trim()));
-        return { ...row, account_id: match ? match.id : (accounts[0]?.id || 0) };
-      });
       const p = qs('#scanPreview');
+      if (p) p.innerHTML = '<div class="card mb-4 p-4"><p class="text-muted">Scanning PDF...</p></div>';
+      const fd = new FormData(); fd.append('file', f);
+      let j;
+      try {
+        const r = await fetch('/api/scan-pdf', { method: 'POST', body: fd });
+        j = await r.json();
+      } catch (e) { j = { success: false, error: e.message }; }
+      ev.target.value = '';
       if (!p) return;
-      p.innerHTML = `<div class="card mb-4 p-4"><h3 class="font-semibold mb-4">Edit & match accounts: ${scanRows.length} row(s)</h3>
-        <table class="mb-4"><thead><tr><th>Account</th><th>Debit</th><th>Credit</th><th>Description</th></tr></thead><tbody>
-        ${scanRows.map((row,i)=>'<tr><td><select id="scanAcc'+i+'" class="w-48">'+accounts.map(a=>'<option value="'+a.id+'"'+(row.account_id==a.id?' selected':'')+'>'+(a.code||'')+' '+a.name+'</option>').join('')+'</select></td><td><input type="number" step="0.01" value="'+row.debit+'" onchange="scanRows['+i+'].debit=parseFloat(this.value)"></td><td><input type="number" step="0.01" value="'+row.credit+'" onchange="scanRows['+i+'].credit=parseFloat(this.value)"></td><td><input value="'+(row.description||'')+'" onchange="scanRows['+i+'].description=this.value" class="w-40"></td></tr>').join('')}
-        </tbody></table><button class="btn-primary" onclick="importScanRows()">Import All</button> <button class="btn-ghost" onclick="scanRows=[];const el=qs(\'#scanPreview\');if(el)el.innerHTML=\'\'">Dismiss</button></div>`;
+      if (!j.success) { p.innerHTML = '<div class="card mb-4 p-4"><p class="text-expense">'+j.error+'</p><button class="btn-ghost" onclick="qs(\'#scanPreview\').innerHTML=\'\'">Dismiss</button></div>'; return; }
+      scanRows = (j.rows || []).map(row => {
+        const match = fuzzyMatchAccount(row.account);
+        return { ...row, account_id: match ? match.id : (accounts[0]?.id || 0), matched: !!match };
+      });
+      p.innerHTML = '<div class="card mb-4 p-4"><h3 class="font-semibold mb-4">Edit & match accounts: '+scanRows.length+' row(s)</h3><table class="mb-4"><thead><tr><th>Date</th><th>Description</th><th>Amount</th><th>Account</th><th>Debit</th><th>Credit</th></tr></thead><tbody>'+
+        scanRows.map((row,i)=>'<tr class="'+(row.matched?'':'scan-unmatched')+'"><td><input type="date" id="scanDate'+i+'" value="'+(row.date||'')+'" class="w-36" onchange="scanRows['+i+'].date=this.value"></td><td><input value="'+(row.description||'').replace(/"/g,'&quot;')+'" onchange="scanRows['+i+'].description=this.value" class="w-48"></td><td class="font-mono">'+fmt(row.debit||row.credit||0)+'</td><td><select id="scanAcc'+i+'" class="w-48 '+(row.matched?'':'border-expense')+'">'+accounts.map(a=>'<option value="'+a.id+'"'+(row.account_id==a.id?' selected':'')+'>'+(a.code||'')+' '+a.name+'</option>').join('')+'</select></td><td><input type="number" step="0.01" id="scanDebit'+i+'" value="'+row.debit+'" class="w-24 text-right" onchange="scanRows['+i+'].debit=parseFloat(this.value)||0"></td><td><input type="number" step="0.01" id="scanCredit'+i+'" value="'+row.credit+'" class="w-24 text-right" onchange="scanRows['+i+'].credit=parseFloat(this.value)||0"></td></tr>').join('')+
+        '</tbody></table><button class="btn-primary" onclick="importScanRows()">Import Selected</button> <button class="btn-ghost" onclick="scanRows=[];qs(\'#scanPreview\').innerHTML=\'\'">Cancel</button></div>';
     }
     async function importScanRows() {
-      const rows = scanRows.map((r,i)=>({...r, account_id: parseInt(qs('#scanAcc'+i)?.value) || r.account_id}));
+      const rows = scanRows.map((r,i)=>({...r, account_id: parseInt(qs('#scanAcc'+i)?.value) || r.account_id, date: qs('#scanDate'+i)?.value || r.date, debit: parseFloat(qs('#scanDebit'+i)?.value)||0, credit: parseFloat(qs('#scanCredit'+i)?.value)||0}));
       const r = await fetch('/api/transactions/import', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ rows }) });
       const j = await r.json();
       if (j.success) { scanRows = []; qs('#scanPreview') && (qs('#scanPreview').innerHTML = ''); load(); alert('Imported ' + j.imported + ' transactions'); }
+      else alert(j.error || 'Import failed');
     }
     let journalLines = [{account_id:'',debit:'',credit:'',memo:''},{account_id:'',debit:'',credit:'',memo:''}];
     function showJournalModal() {
